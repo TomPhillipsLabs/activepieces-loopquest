@@ -165,7 +165,7 @@ export const newVerdict = createTrigger({
       await httpClient.sendRequest({
         method: HttpMethod.DELETE,
         url: `${base(auth)}/api/v1/hooks/${hookId}`,
-        headers: { authorization: `Bearer ${auth.apiKey}` },
+        headers: authHeaders(auth),
       });
     }
   },
