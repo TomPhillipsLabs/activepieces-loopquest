@@ -6,10 +6,12 @@ import {
   Property,
   TriggerStrategy,
 } from "@activepieces/pieces-framework";
+import { PieceCategory } from "@activepieces/shared";
 import { httpClient, HttpMethod } from "@activepieces/pieces-common";
+import { buildTaskBody } from "./body.js";
 
 export const loopquestAuth = PieceAuth.CustomAuth({
-  description: "Your LoopQuest API key (Workspaces -> API keys) and deployment URL.",
+  description: "Your LoopQuest API key (Workspaces → API keys) and, if self-hosting, your deployment URL.",
   required: true,
   props: {
     apiKey: PieceAuth.SecretText({ displayName: "API Key", required: true }),
@@ -24,47 +26,73 @@ export const loopquestAuth = PieceAuth.CustomAuth({
 type Auth = { apiKey: string; baseUrl?: string };
 
 const base = (auth: Auth) => (auth.baseUrl || "https://loopquest.tomphillips.uk").replace(/\/+$/, "");
+const authHeaders = (auth: Auth) => ({ authorization: `Bearer ${auth.apiKey}`, "content-type": "application/json" });
 
 export const createReviewTask = createAction({
   auth: loopquestAuth,
   name: "create_review_task",
   displayName: "Create Review Task",
-  description: "Send content to LoopQuest for a human to review (approve or flag).",
+  description:
+    "Send AI/automation output to a human. Gate a downstream step until it's approved, or monitor quality in the background.",
   props: {
-    content: Property.LongText({ displayName: "Content", required: true }),
+    content: Property.LongText({ displayName: "Content", required: true, description: "The output a human should review." }),
     title: Property.ShortText({ displayName: "Title", required: false }),
     module: Property.StaticDropdown({
-      displayName: "Module",
+      displayName: "Game",
       required: false,
       defaultValue: "swiper",
+      description: "How the reviewer sees the item.",
       options: {
         options: [
-          { label: "Swiper", value: "swiper" },
-          { label: "Detective", value: "detective" },
-          { label: "Decoy", value: "decoy" },
-          { label: "Arena", value: "arena" },
+          { label: "Swiper — approve or reject", value: "swiper" },
+          { label: "Versus — pick the better of two", value: "versus" },
+          { label: "Sorter — bucket into categories", value: "sorter" },
+          { label: "Detective — spot the problem", value: "detective" },
+          { label: "Fixer — correct the output", value: "fixer" },
+          { label: "Redact — mask sensitive text", value: "redact" },
+          { label: "Grounding — verify a claim against a source", value: "grounding" },
         ],
       },
     }),
-    externalId: Property.ShortText({ displayName: "External ID", required: false }),
-    callbackUrl: Property.ShortText({ displayName: "Callback URL", required: false }),
+    mode: Property.StaticDropdown({
+      displayName: "Mode",
+      required: false,
+      defaultValue: "monitor",
+      description: "Gate blocks a downstream step until a human approves (pair with the New Verdict trigger). Monitor reviews in the background.",
+      options: {
+        options: [
+          { label: "Monitor — review in the background", value: "monitor" },
+          { label: "Gate — block until a human approves", value: "gate" },
+        ],
+      },
+    }),
+    claim: Property.LongText({ displayName: "Claim", required: false, description: "Grounding only: the statement to verify." }),
+    sourceText: Property.LongText({ displayName: "Source text", required: false, description: "Grounding only: the reference the claim is checked against." }),
+    timeoutSeconds: Property.Number({ displayName: "Timeout (seconds)", required: false, description: "Gate only: apply the fallback if no one reviews in time (30–2592000)." }),
+    onTimeout: Property.StaticDropdown({
+      displayName: "On timeout",
+      required: false,
+      description: "Gate only: what to do if the timeout is hit. Defaults to escalate (fail-closed).",
+      options: {
+        options: [
+          { label: "Escalate — flag for a human", value: "escalate" },
+          { label: "Reject — treat as a flag", value: "reject" },
+          { label: "Approve — treat as approved", value: "approve" },
+        ],
+      },
+    }),
+    source: Property.ShortText({ displayName: "Source", required: false, defaultValue: "activepieces" }),
+    externalId: Property.ShortText({ displayName: "External ID", required: false, description: "Your own id — echoed back in the verdict for correlation." }),
+    callbackUrl: Property.ShortText({ displayName: "Callback URL", required: false, description: "Optional single webhook for this task's verdict. Leave blank if you use the New Verdict trigger." }),
+    reviewsRequired: Property.Number({ displayName: "Reviewers required", required: false }),
   },
   async run(context) {
     const auth = context.auth as Auth;
-    const p = context.propsValue;
-    const body: Record<string, unknown> = {
-      module: p.module ?? "swiper",
-      payload: { content: p.content },
-      card: { title: p.title || "Review", body: p.content },
-    };
-    if (p.externalId) body["external_id"] = p.externalId;
-    if (p.callbackUrl) body["callback_url"] = p.callbackUrl;
-
     const res = await httpClient.sendRequest({
       method: HttpMethod.POST,
       url: `${base(auth)}/api/v1/tasks`,
-      headers: { authorization: `Bearer ${auth.apiKey}`, "content-type": "application/json" },
-      body,
+      headers: authHeaders(auth),
+      body: buildTaskBody(context.propsValue as Record<string, unknown>),
     });
     return res.body;
   },
@@ -76,7 +104,7 @@ export const getTaskStatus = createAction({
   displayName: "Get Task Status",
   description: "Check a LoopQuest task's status / verdict.",
   props: {
-    taskId: Property.ShortText({ displayName: "Task ID", required: true }),
+    taskId: Property.ShortText({ displayName: "Task ID", required: true, description: "The id returned by Create Review Task." }),
   },
   async run(context) {
     const auth = context.auth as Auth;
@@ -93,15 +121,44 @@ export const newVerdict = createTrigger({
   auth: loopquestAuth,
   name: "new_verdict",
   displayName: "New Verdict",
-  description: "Fires when a LoopQuest verdict arrives. Copy this trigger's URL into the Create Review Task callback_url.",
+  description:
+    "Fires the moment a human reviewer resolves a task — approve, flag, escalate or timeout. Use it to resume a gated action or act on a monitored review.",
   type: TriggerStrategy.WEBHOOK,
   props: {},
-  sampleData: { task_id: "…", verdict: true, external_id: "run-1", source: "activepieces" },
-  async onEnable() {
-    // Passive webhook: the user pastes this trigger's URL as the task callback_url.
+  sampleData: {
+    task_id: "00000000-0000-0000-0000-000000000000",
+    external_id: "order-42",
+    module: "swiper",
+    source: "activepieces",
+    verdict: true,
+    choice: null,
+    reason: null,
+    escalated: false,
+    timed_out: false,
+    reviewed_at: "2026-01-01T00:00:00Z",
   },
-  async onDisable() {
-    // No subscription to tear down.
+  // Auto-subscribe: register this flow's webhook URL with LoopQuest on enable,
+  // remove it on disable. Idempotent by URL server-side.
+  async onEnable(context) {
+    const auth = context.auth as Auth;
+    const res = await httpClient.sendRequest<{ id: string }>({
+      method: HttpMethod.POST,
+      url: `${base(auth)}/api/v1/hooks`,
+      headers: authHeaders(auth),
+      body: { url: context.webhookUrl },
+    });
+    await context.store.put("hookId", res.body.id);
+  },
+  async onDisable(context) {
+    const auth = context.auth as Auth;
+    const hookId = await context.store.get<string>("hookId");
+    if (hookId) {
+      await httpClient.sendRequest({
+        method: HttpMethod.DELETE,
+        url: `${base(auth)}/api/v1/hooks/${hookId}`,
+        headers: { authorization: `Bearer ${auth.apiKey}` },
+      });
+    }
   },
   async run(context) {
     return [context.payload.body];
@@ -110,11 +167,11 @@ export const newVerdict = createTrigger({
 
 export const loopquest = createPiece({
   displayName: "LoopQuest",
-  description: "Send AI output for gamified human-in-the-loop review and get a verdict back.",
+  description: "Human-in-the-loop review for AI output — gate an automation until a person approves, or monitor its quality in the background.",
   auth: loopquestAuth,
   minimumSupportedRelease: "0.20.0",
   logoUrl: "https://loopquest.tomphillips.uk/icon.svg",
-  categories: [],
+  categories: [PieceCategory.ARTIFICIAL_INTELLIGENCE, PieceCategory.PRODUCTIVITY],
   authors: ["TomPhillipsLabs"],
   actions: [createReviewTask, getTaskStatus],
   triggers: [newVerdict],
