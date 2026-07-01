@@ -10,6 +10,11 @@ import { PieceCategory } from "@activepieces/shared";
 import { httpClient, HttpMethod } from "@activepieces/pieces-common";
 import { buildTaskBody } from "./body.js";
 
+type Auth = { apiKey: string; baseUrl?: string };
+
+const base = (auth: Auth) => (auth.baseUrl || "https://loopquest.tomphillips.uk").replace(/\/+$/, "");
+const authHeaders = (auth: Auth) => ({ authorization: `Bearer ${auth.apiKey}`, "content-type": "application/json" });
+
 export const loopquestAuth = PieceAuth.CustomAuth({
   description: "Your LoopQuest API key (Workspaces → API keys) and, if self-hosting, your deployment URL.",
   required: true,
@@ -21,12 +26,16 @@ export const loopquestAuth = PieceAuth.CustomAuth({
       defaultValue: "https://loopquest.tomphillips.uk",
     }),
   },
+  validate: async ({ auth }) => {
+    const a = auth as Auth;
+    try {
+      await httpClient.sendRequest({ method: HttpMethod.GET, url: `${base(a)}/api/v1/me`, headers: authHeaders(a) });
+      return { valid: true };
+    } catch {
+      return { valid: false, error: "Invalid API key or base URL." };
+    }
+  },
 });
-
-type Auth = { apiKey: string; baseUrl?: string };
-
-const base = (auth: Auth) => (auth.baseUrl || "https://loopquest.tomphillips.uk").replace(/\/+$/, "");
-const authHeaders = (auth: Auth) => ({ authorization: `Bearer ${auth.apiKey}`, "content-type": "application/json" });
 
 export const createReviewTask = createAction({
   auth: loopquestAuth,
@@ -111,7 +120,7 @@ export const getTaskStatus = createAction({
     const res = await httpClient.sendRequest({
       method: HttpMethod.GET,
       url: `${base(auth)}/api/v1/tasks/${context.propsValue.taskId}`,
-      headers: { authorization: `Bearer ${auth.apiKey}` },
+      headers: authHeaders(auth),
     });
     return res.body;
   },
